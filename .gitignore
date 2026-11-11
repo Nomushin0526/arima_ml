@@ -1,0 +1,10 @@
+# netkeibaから取得したデータは共有・公開しない（規約第14条）
+cache/
+data/
+*.parquet
+*.csv
+
+__pycache__/
+.venv/
+.ipynb_checkpoints/
+log.txt
