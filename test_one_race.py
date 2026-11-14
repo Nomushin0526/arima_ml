@@ -118,8 +118,15 @@ def main():
     if day:
         dates = timed("開催カレンダー", ns.get_kaisai_dates, int(day[:4]), int(day[4:6]))
         check("開催日一覧", day in dates, f"{len(dates)}日（{day}を含む: {day in dates}）")
-        ids = timed("レース一覧", ns.get_race_ids, day)
+        race_list = timed("レース一覧", ns.get_race_list, day)
+        ids = list(race_list)
         check("レースID一覧", RACE_ID in ids, f"{len(ids)}レース（対象を含む: {RACE_ID in ids}）")
+        read = {k: v for k, v in race_list.items() if v}
+        check("一覧から距離を読めた", len(read) >= len(ids) * 0.9,
+              f"{len(read)}/{len(ids)}レース（読めないと絞り込みが効かず全部取得になる）")
+        print(f"    この開催日の内訳: " + ", ".join(f"{s}{d}m" for s, d in list(read.values())[:12]) + " …")
+        n_want = sum(ns.want_race(c) for c in race_list.values())
+        print(f"    絞り込み（{ns.FILTER['surface']}・{ns.FILTER['min_dist']}m以上）で取得するのは {n_want}/{len(ids)}レース")
     else:
         check("開催日一覧", False, "→ 日付が取れていないため確認できない")
 
@@ -143,6 +150,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except ns.StopRun as e:
+        print(f"\n【停止】{e}")
+        results.append(False)
     except Exception as e:
         import traceback
         traceback.print_exc()

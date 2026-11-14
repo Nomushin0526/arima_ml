@@ -2,8 +2,11 @@
 netkeiba スクレイパー v2（個人の分析用・データは各自で取得し共有しない）
 
 コマンド
-  python netkeiba_scraper.py results 2008 2026   # 年単位で全レースの結果を取得
-  python netkeiba_scraper.py --sleep 5 results 2008 2026   # 間隔をさらに長くする場合
+  python netkeiba_scraper.py results 2021 2026   # 芝1800m以上のレース結果を取得（既定）
+  python netkeiba_scraper.py --min-dist 2000 results 2021 2026   # 芝2000m以上に絞る
+  python netkeiba_scraper.py --surface all --min-dist 0 results 2021 2026   # 全レース
+  python netkeiba_scraper.py --sleep 5 results 2021 2026   # 間隔をさらに長くする場合
+  python netkeiba_scraper.py --max-pages 2000 results 2021 2026   # 1回の通信上限（既定3000）
   python netkeiba_scraper.py ped                 # 取得済み結果に出てくる馬の血統を取得
   python netkeiba_scraper.py ped --since 2018    # 2018年以降に走った馬だけ
   python netkeiba_scraper.py race 202306050811   # 1レースだけ（動作確認用）
@@ -64,6 +67,13 @@ session = requests.Session()
 session.headers.update(HEADERS)
 _last_request = 0.0
 STATS = {"requests": 0, "cache_hits": 0}  # 実際にネットに出た回数 / キャッシュで済んだ回数
+MAX_PAGES = 3000   # 1回の実行で通信してよい上限（キャッシュ読みは数えない）。--max-pages で変更
+BLOCK_CODES = {400, 403, 429, 503}  # アクセス制限の可能性がある応答。来たら即停止
+
+
+class StopRun(BaseException):
+    """実行を安全に止めるための例外（上限到達・アクセス制限の疑い）。
+    レース単位の `except Exception` で握りつぶされないよう BaseException を継承する"""
 
 
 # ============================================================ 通信・キャッシュ
@@ -86,6 +96,10 @@ def fetch(url: str, valid=None) -> str | None:
         STATS["cache_hits"] += 1
         return path.read_text(encoding="utf-8")
 
+    if MAX_PAGES and STATS["requests"] >= MAX_PAGES:
+        raise StopRun(f"今回の上限（{MAX_PAGES}ページ）に達しました。"
+                      "次回、同じコマンドを実行すれば続きから進みます。")
+
     for attempt in range(3):
         wait = SLEEP_SEC + random.uniform(0, JITTER_SEC) - (time.time() - _last_request)
         if wait > 0:
@@ -96,6 +110,10 @@ def fetch(url: str, valid=None) -> str | None:
             r = session.get(url, timeout=30)
             if r.status_code == 404:
                 return None
+            if r.status_code in BLOCK_CODES:
+                raise StopRun(f"HTTP {r.status_code} が返ってきました（{url}）。"
+                              "アクセス制限の可能性があるため停止します。"
+                              "最低でも1日あけ、ブラウザで普通にnetkeibaが見られることを確認してから再開してください。")
             r.raise_for_status()
             html = _decode(r.content)
             if valid is None or valid(html):
@@ -144,8 +162,28 @@ def get_kaisai_dates(year: int, month: int) -> list[str]:
     return sorted(set(re.findall(r"kaisai_date=(\d{8})", html)))
 
 
-def get_race_ids(kaisai_date: str) -> list[str]:
-    """開催日のJRAレースID一覧（12桁・場コード01〜10のみ）"""
+def _race_list_courses(html: str) -> dict[str, tuple[str, int]]:
+    """レース一覧のHTMLから {race_id: (芝/ダ/障, 距離)} を読む。読めないレースは含めない"""
+    out = {}
+    pat = re.compile(r"(?:race_id=|/race/)(\d{12})")
+    soup = BeautifulSoup(html, "lxml")
+    for a in soup.find_all("a", href=pat):
+        rid = pat.search(a["href"]).group(1)
+        if rid in out:
+            continue
+        # リンクの中、なければ一番近い li / tr / dd の中から「芝2000m」などを探す
+        for node in [a] + [a.find_parent(t) for t in ("li", "tr", "dd")]:
+            if node is None:
+                continue
+            m = re.search(r"(芝|ダ|障)\D{0,3}?(\d{3,4})\s*m", _nfkc(node.get_text(" ")))
+            if m:
+                out[rid] = (m.group(1), int(m.group(2)))
+                break
+    return out
+
+
+def get_race_list(kaisai_date: str) -> dict[str, tuple[str, int] | None]:
+    """開催日のJRAレース {race_id: (芝/ダ/障, 距離) or None}（場コード01〜10のみ）"""
     is_past = kaisai_date < date.today().strftime("%Y%m%d")
     pat = re.compile(r"(?:race_id=|/race/)(\d{12})")
 
@@ -156,7 +194,27 @@ def get_race_ids(kaisai_date: str) -> list[str]:
         url = f"https://db.netkeiba.com/race/list/{kaisai_date}/"
         html = fetch(url, valid=lambda h: is_past and bool(pat.search(h))) or ""
         ids = set(pat.findall(html))
-    return sorted(i for i in ids if i[4:6] in PLACE)
+    courses = _race_list_courses(html)
+    return {i: courses.get(i) for i in sorted(ids) if i[4:6] in PLACE}
+
+
+def get_race_ids(kaisai_date: str) -> list[str]:
+    """開催日のJRAレースID一覧（12桁・場コード01〜10のみ）"""
+    return list(get_race_list(kaisai_date))
+
+
+# 取得対象の絞り込み（--surface / --min-dist で変更）
+FILTER = {"surface": "芝", "min_dist": 1800}
+
+
+def want_race(course: tuple[str, int] | None) -> bool:
+    """絞り込み条件に合うか。一覧から距離が読めなかったレースは安全側で取得する"""
+    if course is None:
+        return True
+    surface, dist = course
+    if FILTER["surface"] and surface != FILTER["surface"]:
+        return False
+    return dist >= (FILTER["min_dist"] or 0)
 
 
 # ============================================================ 結果ページ（共通）
@@ -566,7 +624,9 @@ def cmd_results(start_year: int, end_year: int):
             for d in get_kaisai_dates(year, month):
                 if d >= today.strftime("%Y%m%d"):
                     continue
-                ids = get_race_ids(d)
+                race_list = get_race_list(d)
+                ids = [rid for rid, c in race_list.items() if want_race(c)]
+                skipped = len(race_list) - len(ids)
                 for rid in ids:
                     try:
                         got = get_race_result(rid, d)
@@ -578,7 +638,7 @@ def cmd_results(start_year: int, end_year: int):
                         infos.append(got[0]); results.append(got[1]); pays.append(got[2])
                 n_req = STATS["requests"] - req0
                 per = (time.time() - t0) / n_req if n_req else 0
-                print(f"{d}: {len(ids)}R  累計{len(infos)}R  経過{_fmt(time.time() - t0)}"
+                print(f"{d}: {len(ids)}R（対象外{skipped}R）  累計{len(infos)}R  経過{_fmt(time.time() - t0)}"
                       f"  通信{n_req}回（平均{per:.1f}秒/回）", flush=True)
 
         if not infos:
@@ -640,6 +700,9 @@ def cmd_shutuba(race_id: str):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="netkeiba スクレイパー v2")
     ap.add_argument("--sleep", type=float, help=f"最低待ち時間（秒、既定{SLEEP_SEC}、3未満は不可）")
+    ap.add_argument("--max-pages", type=int, help=f"1回の実行で通信する上限ページ数（既定{MAX_PAGES}、0で無制限）")
+    ap.add_argument("--surface", choices=["芝", "ダ", "all"], help="取得する馬場（既定: 芝。all で全部）")
+    ap.add_argument("--min-dist", type=int, help=f"取得する最短距離m（既定: {FILTER['min_dist']}。0で制限なし）")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("results"); p.add_argument("start", type=int); p.add_argument("end", type=int, nargs="?")
     p = sub.add_parser("ped"); p.add_argument("--since", type=int)
@@ -648,6 +711,14 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.sleep is not None:
         SLEEP_SEC = max(3.0, a.sleep)
+    if a.max_pages is not None:
+        MAX_PAGES = a.max_pages
+    if a.surface:
+        FILTER["surface"] = None if a.surface == "all" else a.surface
+    if a.min_dist is not None:
+        FILTER["min_dist"] = a.min_dist
+    if a.cmd == "results":
+        print(f"取得対象: {FILTER['surface'] or '芝・ダ・障'} / {FILTER['min_dist'] or 0}m以上", flush=True)
 
     try:
         if a.cmd == "results":
@@ -658,6 +729,10 @@ if __name__ == "__main__":
             cmd_race(a.race_id)
         elif a.cmd == "shutuba":
             cmd_shutuba(a.race_id)
+    except StopRun as e:
+        print(f"\n【停止】{e}")
+        print(f"今回の通信 {STATS['requests']}回 / キャッシュ利用 {STATS['cache_hits']}回")
+        sys.exit(2)
     except KeyboardInterrupt:
         print("\n中断しました。もう一度同じコマンドを実行すれば、キャッシュを使って続きから進みます。")
         sys.exit(1)
